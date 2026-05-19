@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Virtual heartfelt</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { overflow: hidden; background: #050001; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        #canvas-container { width: 100vw; height: 100vh; position: relative; }
+
+        #info {
+            position: absolute; top: 24px; left: 50%; transform: translateX(-50%);
+            text-align: center; pointer-events: none; z-index: 10;
+            color: #ff8fa3; text-shadow: 0 0 20px rgba(255, 107, 138, 0.6); opacity: 0.9;
+        }
+        #info h1 { font-size: 26px; font-weight: 300; letter-spacing: 6px; margin-bottom: 6px; color: #ffb6c1; }
+        #info .subtitle { font-size: 12px; letter-spacing: 3px; color: #ff6b8a; opacity: 0.7; }
+        #info .equation {
+            margin-top: 10px; font-size: 11px; color: #ffaeb9; opacity: 0.5;
+            font-family: 'Courier New', monospace; line-height: 1.5;
+        }
+        #controls-hint {
+            position: absolute; bottom: 24px; left: 50%; transform: translateX(-50%);
+            color: #ff8fa3; font-size: 11px; opacity: 0.4; pointer-events: none; letter-spacing: 2px;
+        }
+    </style>
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+        }
+    }
+    </script>
+<base target="_blank">
+</head>
+<body>
+    <div id="canvas-container">
+        <div id="info">
+            <h1>❤ Fake pixels. True pulse. ❤</h1>
+            <div class="subtitle">Heartbeat:the universe's most elegant algorithm.</div>
+            <div class="equation">
+                (r² - 1)³ = r⁵·cos³θ·sin²θ·(cos²φ + 1/10·sin²φ)<br>
+                x = r·sinθ·cosφ &nbsp;&nbsp; y = r·sinθ·sinφ &nbsp;&nbsp; z = r·cosθ
+            </div>
+        </div>
+        <div id="controls-hint">🖱 拖拽旋转 · 滚轮缩放 · 右键平移 or Ctrl左键平移</div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // ============================================================
+        // 1. 全局配置（扁平化）
+        // ============================================================
+        const CONFIG = {
+            // 色彩
+            bgParticle: 0xff8fa3,
+            heartCore: 0xffd1dc,
+            fog: 0x050001,
+
+            // 几何细分
+            bgCount: 500,
+            heartTheta: 180,
+            heartPhi: 180,
+
+            // 动画时序
+            pulseSpeed: 2.5,
+            pulseAmp: 0.1,
+
+            // 通用片元着色器：粒子光晕、核心与雾效合成
+            // 管线：圆形 discard → core 亮斑 → glow 晕轮 → 热白核心混合 → 脉冲调制 → 指数雾效
+            fragmentShader: `
+                precision highp float;
+                varying vec3 vColor;
+                varying float vAlpha;
+                varying float vDist;
+                varying float vGlow;
+
+                void main() {
+                    vec2 coord = gl_PointCoord - vec2(0.5);
+                    float dist = length(coord);
+                    if (dist > 0.5) discard;
+
+                    float core = 1.0 - smoothstep(0.0, 0.12, dist);
+                    float glow = pow(1.0 - smoothstep(0.0, 0.42, dist), 2.0);
+
+                    vec3 coreColor = vec3(1.0, 0.90, 0.95);
+                    vec3 finalColor = mix(vColor * glow, coreColor, core * 0.3);
+                    finalColor *= (0.9 + 0.12 * vGlow);
+
+                    float fogFactor = smoothstep(2.0, 7.0, vDist);
+                    finalColor *= (1.0 - fogFactor * 0.6);
+
+                    float alpha = (glow * 0.8 + core * 0.15) * vAlpha * (1.0 - fogFactor * 0.4);
+                    gl_FragColor = vec4(finalColor, alpha);
+                }
+            `,
+
+            // 心形顶点着色器：异步心跳脉冲 + 透视尺寸校正
+            heartVertex: `
+                uniform float uTime;
+                uniform float uPulseSpeed;
+                uniform float uPulseAmp;
+                uniform float uBaseSize;
+                attribute vec3 aColor;
+                attribute float aPhase;
+                attribute float aSize;
+                varying vec3 vColor;
+                varying float vAlpha;
+                varying float vDist;
+                varying float vGlow;
+
+                void main() {
+                    vColor = aColor;
+                    vAlpha = 1.0;
+
+                    float pulse = 1.0 + uPulseAmp * sin(uTime * uPulseSpeed + aPhase * 0.3);
+                    vGlow = pulse;
+
+                    vec3 newPos = position * pulse;
+                    vec4 mvPosition = modelViewMatrix * vec4(newPos, 1.0);
+                    gl_Position = projectionMatrix * mvPosition;
+
+                    vDist = -mvPosition.z;
+                    float perspective = 40.0 / vDist;
+                    gl_PointSize = clamp(uBaseSize * aSize * pulse * perspective, 0.8, 8.0);
+                }
+            `,
+
+            // 背景顶点着色器：深空漂移 + 距离雾化 + 像素比适配
+            bgVertex: `
+                uniform float uTime;
+                uniform vec3 uColor;
+                uniform float uPixelRatio;
+                varying vec3 vColor;
+                varying float vAlpha;
+                varying float vDist;
+                varying float vGlow;
+
+                void main() {
+                    vColor = uColor;
+                    vGlow = 1.0;
+                    vAlpha = 1.0;
+
+                    vec3 pos = position;
+                    pos.y += sin(uTime * 0.2 + position.x * 0.5) * 0.5;
+                    pos.x += cos(uTime * 0.15 + position.y * 0.5) * 0.3;
+
+                    vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
+                    gl_Position = projectionMatrix * mvPosition;
+
+                    vDist = -mvPosition.z;
+                    gl_PointSize = (1.0 * uPixelRatio) * (100.0 / vDist);
+                    vAlpha = smoothstep(15.0, 2.0, vDist);
+                }
+            `
+        };
+
+        // ============================================================
+        // 2. Taubin 心形隐式方程求解器（纯函数）
+        // ============================================================
+        // Taubin 方程（球坐标）:
+        //   (r² − 1)³ = r⁵ · cos³θ · sin²θ · (cos²φ + 0.1·sin²φ)
+        // 对固定 (θ, φ)，右侧为常数 C，转化为 f(r) = (r² − 1)³ − r⁵·C = 0
+        // 二分法 50 次迭代，精度远超 GPU 浮点需求。
+        function solveTaubinR(theta, phi) {
+            const sinT = Math.sin(theta), cosT = Math.cos(theta);
+            const sinP = Math.sin(phi), cosP = Math.cos(phi);
+            const C = cosT * cosT * cosT * sinT * sinT * (cosP * cosP + 0.1 * sinP * sinP);
+            const f = (r) => Math.pow(r * r - 1.0, 3) - Math.pow(r, 5) * C;
+
+            if (Math.abs(C) < 1e-14) return 1.0;
+
+            let rLo, rHi;
+            if (C > 0) {
+                rLo = 1.0; rHi = 2.0;
+                while (f(rHi) < 0 && rHi < 100.0) rHi *= 2.0;
+            } else {
+                rLo = 1e-6; rHi = 1.0;
+            }
+
+            for (let i = 0; i < 50; i++) {
+                const rMid = (rLo + rHi) * 0.5;
+                const fm = f(rMid);
+                if (Math.abs(fm) < 1e-12) return rMid;
+                fm > 0.0 ? (rHi = rMid) : (rLo = rMid);
+            }
+            return (rLo + rHi) * 0.5;
+        }
+
+        // ============================================================
+        // 3. 粒子几何生成（纯函数替代 ParticleFactory）
+        // ============================================================
+        // 采样策略：
+        //   1. 显式插入北极与南极，封闭几何体。
+        //   2. 球坐标均匀采样 θ∈(0,π), φ∈[0,2π)。
+        //   3. 颜色映射：基于归一化高度与水平距离构建粉白体积渐变。
+        function createHeartGeometry() {
+            const positions = [], colors = [], phases = [], sizes = [];
+            const { heartTheta: thetaSeg, heartPhi: phiSeg } = CONFIG;
+
+            // 北极（顶部尖端，亮粉色）
+            positions.push(0, 1, 0);
+            colors.push(0.90, 0.60, 0.70);
+            phases.push(Math.random() * Math.PI * 2);
+            sizes.push(0.7 + Math.random() * 0.4);
+
+            for (let i = 1; i < thetaSeg - 1; i++) {
+                const theta = (i / (thetaSeg - 1)) * Math.PI;
+                for (let j = 0; j < phiSeg; j++) {
+                    const phi = (j / phiSeg) * Math.PI * 2;
+                    const r = solveTaubinR(theta, phi);
+
+                    const x = r * Math.sin(theta) * Math.cos(phi);
+                    const z = r * Math.sin(theta) * Math.sin(phi);
+                    const y = r * Math.cos(theta);
+
+                    const distXY = Math.sqrt(x * x + z * z);
+                    const normZ = (y + 1.0) / 2.3;
+
+                    const rCol = Math.min(1.0, 0.82 + 0.18 * Math.max(0.0, normZ));
+                    const gCol = Math.min(1.0, 0.04 + 0.38 * Math.max(0.0, normZ) + 0.08 * (1.0 - distXY / 1.2));
+                    const bCol = Math.min(1.0, 0.06 + 0.28 * Math.max(0.0, normZ));
+
+                    positions.push(x, y, z);
+                    colors.push(rCol, gCol, bCol);
+                    phases.push(Math.random() * Math.PI * 2);
+                    sizes.push(0.7 + Math.random() * 0.4);
+                }
+            }
+
+            // 南极（底部收窄，暗红色）
+            positions.push(0, -1, 0);
+            colors.push(0.80, 0.20, 0.30);
+            phases.push(Math.random() * Math.PI * 2);
+            sizes.push(0.7 + Math.random() * 0.4);
+
+            const geometry = new THREE.BufferGeometry();
+            geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+            geometry.setAttribute('aColor', new THREE.Float32BufferAttribute(colors, 3));
+            geometry.setAttribute('aPhase', new THREE.Float32BufferAttribute(phases, 1));
+            geometry.setAttribute('aSize', new THREE.Float32BufferAttribute(sizes, 1));
+            return geometry;
+        }
+
+        function createBackgroundParticles(scene) {
+            const geometry = new THREE.BufferGeometry();
+            const count = CONFIG.bgCount;
+            const positions = new Float32Array(count * 3);
+            for (let i = 0; i < count; i++) {
+                positions[i * 3] = (Math.random() - 0.5) * 12.0;
+                positions[i * 3 + 1] = (Math.random() - 0.5) * 12.0;
+                positions[i * 3 + 2] = (Math.random() - 0.5) * 12.0;
+            }
+            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+
+            const material = new THREE.ShaderMaterial({
+                uniforms: {
+                    uTime: { value: 0.0 },
+                    uColor: { value: new THREE.Color(CONFIG.bgParticle) },
+                    uPixelRatio: { value: Math.min(window.devicePixelRatio, 2) }
+                },
+                vertexShader: CONFIG.bgVertex,
+                fragmentShader: CONFIG.fragmentShader,
+                transparent: true,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false,
+                depthTest: true
+            });
+
+            const points = new THREE.Points(geometry, material);
+            scene.add(points);
+            return { points, material };
+        }
+
+        // ============================================================
+        // 4. 场景初始化与渲染循环
+        // ============================================================
+        function init() {
+            const container = document.getElementById('canvas-container');
+
+            const scene = new THREE.Scene();
+            scene.fog = new THREE.FogExp2(CONFIG.fog, 0.015);
+
+            const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 1000.0);
+            camera.position.set(0.0, 2, 5);
+
+            const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            renderer.toneMapping = THREE.ACESFilmicToneMapping;
+            renderer.toneMappingExposure = 1.1;
+            container.appendChild(renderer.domElement);
+
+            const controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+            controls.minDistance = 1.2;
+            controls.maxDistance = 8.0;
+
+            const heartGeometry = createHeartGeometry();
+            const heartMaterial = new THREE.ShaderMaterial({
+                uniforms: {
+                    uTime: { value: 0.0 },
+                    uPulseSpeed: { value: CONFIG.pulseSpeed },
+                    uPulseAmp: { value: CONFIG.pulseAmp },
+                    uBaseSize: { value: 3.5 }
+                },
+                vertexShader: CONFIG.heartVertex,
+                fragmentShader: CONFIG.fragmentShader,
+                transparent: true,
+                depthWrite: false,
+                blending: THREE.AdditiveBlending
+            });
+            const heartParticles = new THREE.Points(heartGeometry, heartMaterial);
+            scene.add(heartParticles);
+
+            const { points: bgPoints, material: bgMaterial } = createBackgroundParticles(scene);
+
+            const clock = new THREE.Clock();
+            function animate() {
+                requestAnimationFrame(animate);
+                const time = clock.getElapsedTime();
+                heartMaterial.uniforms.uTime.value = time;
+                bgMaterial.uniforms.uTime.value = time;
+                controls.update();
+                renderer.render(scene, camera);
+            }
+            animate();
+
+            window.addEventListener('resize', () => {
+                camera.aspect = window.innerWidth / window.innerHeight;
+                camera.updateProjectionMatrix();
+                renderer.setSize(window.innerWidth, window.innerHeight);
+            });
+        }
+
+        init();
+    </script>
+</body>
+</html>
